@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 type transaction struct {
@@ -22,12 +23,17 @@ type output struct {
 	count int
 }
 
+var wg sync.WaitGroup
+var lock sync.Mutex
+
 const (
 	PAGE_SIZE = 25
 
 	BLOCK_HEIGHT_URL = "https://blockstream.info/api/block-height/"
 
 	BLOCK_TRNASACTIONS_URL = "https://blockstream.info/api/block/%s/txs/%s"
+
+	BLOCK_TOTAL_TRANSACTIONS = "https://blockstream.info/api/block/%s/txids"
 )
 
 func main() {
@@ -45,7 +51,7 @@ func main() {
 }
 
 func getTop10ForBlock(block_height string) ([]output, error) {
-	var totalTransactions []transaction
+	totalTransactionMap := make(map[string]transaction)
 	hash, err := fetchDataFromUrl(BLOCK_HEIGHT_URL + block_height)
 	if err != nil {
 		return nil, err
@@ -54,39 +60,57 @@ func getTop10ForBlock(block_height string) ([]output, error) {
 		return nil, errors.New("Block not found")
 	}
 	fmt.Println("hashrespmap: ", hash)
-	page_num := 0
-	for {
-		respbody, e := fetchDataFromUrl(fmt.Sprintf(BLOCK_TRNASACTIONS_URL, hash, strconv.Itoa(page_num*PAGE_SIZE)))
-		if e != nil {
-			return nil, e
-		}
-		if respbody == "start index out of range" {
-			break
-		}
-		var transactionsdata []interface{}
-		err := json.Unmarshal([]byte(respbody), &transactionsdata)
-		if err != nil {
-			return nil, err
-		}
 
-		for _, trans := range transactionsdata {
-			tranmap := trans.(map[string]interface{})
-			var tran transaction
-			tran.id = tranmap["txid"].(string)
-			inputs := reflect.ValueOf(tranmap["vin"])
-			for i := 0; i < inputs.Len(); i++ {
-				iput := inputs.Index(i).Interface()
-				inputmap := iput.(map[string]interface{})
-				inputid := inputmap["txid"].(string)
-				tran.inputs = append(tran.inputs, inputid)
-			}
-			totalTransactions = append(totalTransactions, tran)
-		}
-		page_num++
+	txidsresp, er := fetchDataFromUrl(fmt.Sprintf(BLOCK_TOTAL_TRANSACTIONS, hash))
+	if er != nil {
+		return nil, er
 	}
-	fmt.Println("total transactions: ", totalTransactions)
-	fmt.Println("transaction map: ", getCountMapForTrasactions(totalTransactions))
-	return getTop10(getCountMapForTrasactions(totalTransactions)), nil
+
+	var totaltxs []interface{}
+	er = json.Unmarshal([]byte(txidsresp), &totaltxs)
+	if er != nil {
+		return nil, er
+	}
+	page_index := 0
+	for (page_index * PAGE_SIZE) < len(totaltxs) {
+		wg.Add(1)
+		go updateTransactionsFromIndex(hash, page_index, totalTransactionMap)
+		page_index++
+	}
+	wg.Wait()
+	fmt.Println("total transactions: ", totalTransactionMap)
+	fmt.Println("transaction map: ", getCountMapForTrasactions(totalTransactionMap))
+	return getTop10(getCountMapForTrasactions(totalTransactionMap)), nil
+}
+
+func updateTransactionsFromIndex(hash string, idx int, tMap map[string]transaction) {
+	respbody, e := fetchDataFromUrl(fmt.Sprintf(BLOCK_TRNASACTIONS_URL, hash, strconv.Itoa(idx*PAGE_SIZE)))
+	if e != nil {
+		fmt.Println("error fetching transactions from index: ", idx, e)
+		return
+	}
+	var transactionsdata []interface{}
+	err := json.Unmarshal([]byte(respbody), &transactionsdata)
+	if err != nil {
+		fmt.Println("error fetching transactions from index: ", idx, err)
+		return
+	}
+	lock.Lock()
+	for _, trans := range transactionsdata {
+		tranmap := trans.(map[string]interface{})
+		var tran transaction
+		tran.id = tranmap["txid"].(string)
+		inputs := reflect.ValueOf(tranmap["vin"])
+		for i := 0; i < inputs.Len(); i++ {
+			iput := inputs.Index(i).Interface()
+			inputmap := iput.(map[string]interface{})
+			inputid := inputmap["txid"].(string)
+			tran.inputs = append(tran.inputs, inputid)
+		}
+		tMap[tran.id] = tran
+	}
+	lock.Unlock()
+	wg.Done()
 }
 
 func getTop10(m map[string]int) []output {
@@ -109,15 +133,11 @@ func getTop10(m map[string]int) []output {
 	return outs
 }
 
-func getCountMapForTrasactions(totaltrans []transaction) map[string]int {
+func getCountMapForTrasactions(tMap map[string]transaction) map[string]int {
 	transactioncountmap := make(map[string]int)
-	validTransactionMap := make(map[string]transaction)
-	for _, t := range totaltrans {
-		validTransactionMap[t.id] = t
-	}
 
-	for _, tn := range totaltrans {
-		transactioncountmap[tn.id] = findAncestorsForTransaction(tn, validTransactionMap)
+	for _, tn := range tMap {
+		transactioncountmap[tn.id] = findAncestorsForTransaction(tn, tMap)
 	}
 	return transactioncountmap
 }
